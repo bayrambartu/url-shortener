@@ -4,8 +4,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -26,43 +28,67 @@ type Link struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+//	func LoadEnv() {
+//		if err := godotenv.Load(); err != nil {
+//			fmt.Println("Error loading .env file:", err)
+//		}
+//	}
 func main() {
 	mux := http.NewServeMux()
-	dsn := "host=localhost port=5432 user=postgres password=postgres dbname=shortener sslmode=disable"
+	//LoadEnv()
 
+	// DSN yerine DATABASE_URL okuyoruz
+	dbUrl := os.Getenv("DATABASE_URL")
+	if dbUrl == "" {
+		log.Fatal("DATABASE_URL ortam değişkeni bulunamadı")
+	}
+
+	var db *sql.DB
 	var err error
 
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		fmt.Println("Error opening database:", err)
-		return
+	// Docker'da veritabanının tamamen hazır olması 2-3 saniye sürebilir.
+	// Hemen çökmek yerine kısa bir bekleme (retry) mekanizması ekliyoruz.
+	for i := 0; i < 5; i++ {
+		db, err = sql.Open("postgres", dbUrl)
+		if err == nil {
+			err = db.Ping()
+			if err == nil {
+				break // Bağlantı başarılı, döngüden çık
+			}
+		}
+		fmt.Println("Veritabanı henüz hazır değil, tekrar deneniyor...")
+		time.Sleep(2 * time.Second)
 	}
-	createTableQuery := `
-	CREATE TABLE IF NOT EXISTS links (
-		id SERIAL PRIMARY KEY,
-		short_code VARCHAR(255) UNIQUE NOT NULL,
-		original_url TEXT NOT NULL,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-	`
-	_, err = db.Exec(createTableQuery)
+
 	if err != nil {
-		fmt.Println("Error creating table:", err)
-		return
+		log.Fatal("Veritabanına bağlanılamadı:", err)
 	}
 	defer db.Close()
+
+	fmt.Println("Veritabanına başarıyla bağlanıldı!")
+
+	createTableQuery := `
+    CREATE TABLE IF NOT EXISTS links (
+        id SERIAL PRIMARY KEY,
+        short_code VARCHAR(255) UNIQUE NOT NULL,
+        original_url TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    `
+	_, err = db.Exec(createTableQuery)
+	if err != nil {
+		log.Fatal("Tablo oluşturulurken hata:", err)
+	}
 
 	server := &Server{DB: db}
 	mux.HandleFunc("/shorten", server.AddLink)
 	mux.HandleFunc("/code", server.GetOriginalURL)
 	mux.HandleFunc("/getall", server.GetAllLinks)
 
-	fmt.Println("Connecting to database...")
 	fmt.Println("Server is running on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
-		fmt.Println("Error starting server:", err)
+		log.Fatal("Error starting server:", err)
 	}
-
 }
 
 func generateRandomString(length int) string {
