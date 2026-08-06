@@ -9,18 +9,25 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
+  mongo:
+    image: mongo:8
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
   api:
     build: .
     container_name: url-shortener-api
-
     ports:
       - "8080:8080"
-
     env_file:
       - .env
-
     depends_on:
       - db
+      - mongo
 
 volumes:
   postgres_data:
+  mongo_data:

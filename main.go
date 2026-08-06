@@ -1,16 +1,21 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"time"
+	mongoo "url-shotener/mongo"
 
 	_ "github.com/lib/pq"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -19,7 +24,8 @@ type ShortenRequest struct {
 	Address string `json:"address"`
 }
 type Server struct {
-	DB *sql.DB
+	DB      *sql.DB
+	DBMongo *mongo.Client
 }
 type Link struct {
 	ID          string    `json:"id"`
@@ -27,15 +33,18 @@ type Link struct {
 	OriginalURL string    `json:"original_url"`
 	CreatedAt   time.Time `json:"created_at"`
 }
+type ClickEvent struct {
+	ID        string    `json:"id"`
+	LinkID    string    `json:"link_id"`
+	ClickedAt time.Time `json:"clicked_at"`
+	UserAgent string    `json:"user_agent"`
+	IPAddress string    `json:"ip_address"`
+	Country   string    `json:"country"`
+	Referrer  string    `json:"referrer"`
+}
 
-//	func LoadEnv() {
-//		if err := godotenv.Load(); err != nil {
-//			fmt.Println("Error loading .env file:", err)
-//		}
-//	}
 func main() {
 	mux := http.NewServeMux()
-	//LoadEnv()
 
 	// DSN yerine DATABASE_URL okuyoruz
 	dbUrl := os.Getenv("DATABASE_URL")
@@ -67,6 +76,9 @@ func main() {
 
 	fmt.Println("Veritabanına başarıyla bağlanıldı!")
 
+	client := mongoo.ConnectMongoDB()
+	defer client.Disconnect(context.Background())
+
 	createTableQuery := `
     CREATE TABLE IF NOT EXISTS links (
         id SERIAL PRIMARY KEY,
@@ -80,7 +92,7 @@ func main() {
 		log.Fatal("Tablo oluşturulurken hata:", err)
 	}
 
-	server := &Server{DB: db}
+	server := &Server{DB: db, DBMongo: client}
 	mux.HandleFunc("/shorten", server.AddLink)
 	mux.HandleFunc("/code", server.GetOriginalURL)
 	mux.HandleFunc("/getall", server.GetAllLinks)
@@ -137,6 +149,7 @@ func (s *Server) GetOriginalURL(w http.ResponseWriter, r *http.Request) {
 	}
 	var link Link
 	err := s.DB.QueryRow("SELECT * FROM links WHERE short_code = $1", shortenedURL).Scan(&link.ID, &link.ShortCode, &link.OriginalURL, &link.CreatedAt)
+
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// http.Error(w, "Shortened URL not found", http.StatusNotFound)
@@ -145,6 +158,35 @@ func (s *Server) GetOriginalURL(w http.ResponseWriter, r *http.Request) {
 		}
 		http.Error(w, "Error fetching URL", http.StatusInternalServerError)
 		return
+	}
+
+	host := r.RemoteAddr
+	if ip, _, err := net.SplitHostPort(host); err == nil {
+		host = ip
+	}
+
+	referrer := r.Referer()
+
+	_, err = s.DBMongo.Database("shortener").Collection("ClickEvent").InsertOne(context.Background(), bson.M{
+		"link_id":    link.ID,
+		"user_agent": r.UserAgent(),
+		"ip_address": host,
+		"country":    "",
+		"referrer":   referrer,
+	})
+	if err != nil {
+		log.Println("click event insert error:", err)
+	}
+
+	count, _ := s.DBMongo.
+		Database("shortener").
+		Collection("ClickEvent").
+		CountDocuments(context.Background(), bson.M{})
+
+	log.Println("Document count:", count)
+
+	if err != nil {
+		log.Println("click event insert error:", err)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	//json.NewEncoder(w).Encode(link)
