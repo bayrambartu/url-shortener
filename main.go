@@ -1,14 +1,21 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/rand/v2"
+	"net"
 	"net/http"
+	"os"
 	"time"
+	mongoo "url-shotener/mongo"
 
 	_ "github.com/lib/pq"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
 const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -17,7 +24,8 @@ type ShortenRequest struct {
 	Address string `json:"address"`
 }
 type Server struct {
-	DB *sql.DB
+	DB      *sql.DB
+	DBMongo *mongo.Client
 }
 type Link struct {
 	ID          string    `json:"id"`
@@ -25,44 +33,74 @@ type Link struct {
 	OriginalURL string    `json:"original_url"`
 	CreatedAt   time.Time `json:"created_at"`
 }
+type ClickEvent struct {
+	ID        string    `json:"id"`
+	LinkID    string    `json:"link_id"`
+	ClickedAt time.Time `json:"clicked_at"`
+	UserAgent string    `json:"user_agent"`
+	IPAddress string    `json:"ip_address"`
+	Country   string    `json:"country"`
+	Referrer  string    `json:"referrer"`
+}
 
 func main() {
 	mux := http.NewServeMux()
-	dsn := "host=localhost port=5432 user=postgres password=postgres dbname=shortener sslmode=disable"
 
+	// DSN yerine DATABASE_URL okuyoruz
+	dbUrl := os.Getenv("DATABASE_URL")
+	if dbUrl == "" {
+		log.Fatal("DATABASE_URL ortam değişkeni bulunamadı")
+	}
+
+	var db *sql.DB
 	var err error
 
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		fmt.Println("Error opening database:", err)
-		return
+	// Docker'da veritabanının tamamen hazır olması 2-3 saniye sürebilir.
+	// Hemen çökmek yerine kısa bir bekleme (retry) mekanizması ekliyoruz.
+	for i := 0; i < 5; i++ {
+		db, err = sql.Open("postgres", dbUrl)
+		if err == nil {
+			err = db.Ping()
+			if err == nil {
+				break // Bağlantı başarılı, döngüden çık
+			}
+		}
+		fmt.Println("Veritabanı henüz hazır değil, tekrar deneniyor...")
+		time.Sleep(2 * time.Second)
 	}
-	createTableQuery := `
-	CREATE TABLE IF NOT EXISTS links (
-		id SERIAL PRIMARY KEY,
-		short_code VARCHAR(255) UNIQUE NOT NULL,
-		original_url TEXT NOT NULL,
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-	`
-	_, err = db.Exec(createTableQuery)
+
 	if err != nil {
-		fmt.Println("Error creating table:", err)
-		return
+		log.Fatal("Veritabanına bağlanılamadı:", err)
 	}
 	defer db.Close()
 
-	server := &Server{DB: db}
+	fmt.Println("Veritabanına başarıyla bağlanıldı!")
+
+	client := mongoo.ConnectMongoDB()
+	defer client.Disconnect(context.Background())
+
+	createTableQuery := `
+    CREATE TABLE IF NOT EXISTS links (
+        id SERIAL PRIMARY KEY,
+        short_code VARCHAR(255) UNIQUE NOT NULL,
+        original_url TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    `
+	_, err = db.Exec(createTableQuery)
+	if err != nil {
+		log.Fatal("Tablo oluşturulurken hata:", err)
+	}
+
+	server := &Server{DB: db, DBMongo: client}
 	mux.HandleFunc("/shorten", server.AddLink)
 	mux.HandleFunc("/code", server.GetOriginalURL)
 	mux.HandleFunc("/getall", server.GetAllLinks)
 
-	fmt.Println("Connecting to database...")
 	fmt.Println("Server is running on http://localhost:8080")
 	if err := http.ListenAndServe(":8080", mux); err != nil {
-		fmt.Println("Error starting server:", err)
+		log.Fatal("Error starting server:", err)
 	}
-
 }
 
 func generateRandomString(length int) string {
@@ -111,6 +149,7 @@ func (s *Server) GetOriginalURL(w http.ResponseWriter, r *http.Request) {
 	}
 	var link Link
 	err := s.DB.QueryRow("SELECT * FROM links WHERE short_code = $1", shortenedURL).Scan(&link.ID, &link.ShortCode, &link.OriginalURL, &link.CreatedAt)
+
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// http.Error(w, "Shortened URL not found", http.StatusNotFound)
@@ -119,6 +158,35 @@ func (s *Server) GetOriginalURL(w http.ResponseWriter, r *http.Request) {
 		}
 		http.Error(w, "Error fetching URL", http.StatusInternalServerError)
 		return
+	}
+
+	host := r.RemoteAddr
+	if ip, _, err := net.SplitHostPort(host); err == nil {
+		host = ip
+	}
+
+	referrer := r.Referer()
+
+	_, err = s.DBMongo.Database("shortener").Collection("ClickEvent").InsertOne(context.Background(), bson.M{
+		"link_id":    link.ID,
+		"user_agent": r.UserAgent(),
+		"ip_address": host,
+		"country":    "",
+		"referrer":   referrer,
+	})
+	if err != nil {
+		log.Println("click event insert error:", err)
+	}
+
+	count, _ := s.DBMongo.
+		Database("shortener").
+		Collection("ClickEvent").
+		CountDocuments(context.Background(), bson.M{})
+
+	log.Println("Document count:", count)
+
+	if err != nil {
+		log.Println("click event insert error:", err)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	//json.NewEncoder(w).Encode(link)
