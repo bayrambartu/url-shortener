@@ -32,7 +32,7 @@ func ConnectMongoDB() *mongo.Client {
 		log.Fatal(err)
 	}
 
-	fmt.Println("MongoDB Connected 🚀")
+	fmt.Println("MongoDB Connected ")
 
 	return client
 }

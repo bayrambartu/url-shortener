@@ -10,10 +10,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 	mongoo "url-shotener/mongo"
+	"url-shotener/postgres"
 
 	_ "github.com/lib/pq"
+	ampq "github.com/rabbitmq/amqp091-go"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
@@ -24,9 +27,13 @@ type ShortenRequest struct {
 	Address string `json:"address"`
 }
 type Server struct {
-	DB      *sql.DB
-	DBMongo *mongo.Client
+	DB           *sql.DB
+	DBMongo      *mongo.Client
+	rabbitMQConn *ampq.Connection
+	rabbitMQChan *ampq.Channel
+	rabbitMu     sync.Mutex
 }
+
 type Link struct {
 	ID          string    `json:"id"`
 	ShortCode   string    `json:"short_code"`
@@ -55,26 +62,11 @@ func main() {
 	var db *sql.DB
 	var err error
 
-	// Docker'da veritabanının tamamen hazır olması 2-3 saniye sürebilir.
-	// Hemen çökmek yerine kısa bir bekleme (retry) mekanizması ekliyoruz.
-	for i := 0; i < 5; i++ {
-		db, err = sql.Open("postgres", dbUrl)
-		if err == nil {
-			err = db.Ping()
-			if err == nil {
-				break // Bağlantı başarılı, döngüden çık
-			}
-		}
-		fmt.Println("Veritabanı henüz hazır değil, tekrar deneniyor...")
-		time.Sleep(2 * time.Second)
-	}
-
+	db, err = postgres.ConnectPostgres(dbUrl)
 	if err != nil {
-		log.Fatal("Veritabanına bağlanılamadı:", err)
+		log.Fatal("PostgreSQL'a bağlanılamadı:", err)
 	}
 	defer db.Close()
-
-	fmt.Println("Veritabanına başarıyla bağlanıldı!")
 
 	client := mongoo.ConnectMongoDB()
 	defer client.Disconnect(context.Background())
@@ -91,8 +83,43 @@ func main() {
 	if err != nil {
 		log.Fatal("Tablo oluşturulurken hata:", err)
 	}
+	// RabbitMQ connection
+	rabbitMQConn, err := ampq.Dial(os.Getenv("RABBITMQ_URI"))
+	if err != nil {
+		log.Println("Failed to connect to RabbitMQ:", err)
+		return
+	}
+	fmt.Println("Connected to RabbitMQ")
+	defer rabbitMQConn.Close()
 
-	server := &Server{DB: db, DBMongo: client}
+	// RabbitMQ channel
+	rabbitCh, err := rabbitMQConn.Channel()
+	if err != nil {
+		log.Fatal("Failed to open RabbitMQ channel:", err)
+	}
+	fmt.Println("RabbitMQ channel opened")
+	defer rabbitCh.Close()
+
+	err = rabbitCh.ExchangeDeclare("logs", "direct", true, false, false, false, nil)
+	if err != nil {
+		log.Fatal("Failed to declare exchange:", err)
+	}
+	fmt.Println("Exchange declared")
+
+	_, err = rabbitCh.QueueDeclare("shortened_urls", true, false, false, false, nil)
+	if err != nil {
+		log.Fatal("Failed to declare queue:", err)
+	}
+	fmt.Println("Queue declared")
+
+	err = rabbitCh.QueueBind("shortened_urls", "shortened_urls_routing_key", "logs", false, nil)
+	if err != nil {
+		log.Fatal("Failed to bind queue:", err)
+	}
+	fmt.Println("Queue bound to exchange")
+
+	server := &Server{DB: db, DBMongo: client, rabbitMQConn: rabbitMQConn, rabbitMQChan: rabbitCh}
+
 	mux.HandleFunc("/shorten", server.AddLink)
 	mux.HandleFunc("/code", server.GetOriginalURL)
 	mux.HandleFunc("/getall", server.GetAllLinks)
@@ -114,6 +141,7 @@ func generateRandomString(length int) string {
 }
 
 func (s *Server) AddLink(w http.ResponseWriter, r *http.Request) {
+	log.Println("===== AddLink called =====")
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -126,14 +154,55 @@ func (s *Server) AddLink(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
+	var count int
+	s.DB.QueryRow("SELECT COUNT(*) FROM links WHERE original_url = $1", req.Address).Scan(&count)
+	if count > 0 {
+		http.Error(w, "Address already exists", http.StatusConflict)
+		return
+	}
+
 	_, err = s.DB.Exec("INSERT INTO links (short_code, original_url) VALUES ($1, $2)", generatedString, req.Address)
 	if err != nil {
 		http.Error(w, "Failed to store URL", http.StatusInternalServerError)
 		return
 	}
+	var id int
+	row := s.DB.QueryRow("SELECT id FROM links WHERE short_code = $1", generatedString).Scan(&id)
+	if row != nil {
+		http.Error(w, "Failed to retrieve link ID", http.StatusInternalServerError)
+		return
+	}
+
+	type LinkMessage struct {
+		ID      int    `json:"id"`
+		Address string `json:"address"`
+	}
+
+	msg := LinkMessage{ID: id, Address: req.Address}
+	body, _ := json.Marshal(msg)
+
+	s.rabbitMu.Lock()
+	defer s.rabbitMu.Unlock()
+
+	err = s.rabbitMQChan.Publish(
+		"logs",
+		"shortened_urls_routing_key",
+		false,
+		false,
+		ampq.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		},
+	)
+	if err != nil {
+		log.Println("Failed to publish message:", err)
+		http.Error(w, "Failed to queue link for verification", http.StatusInternalServerError)
+		return
+	}
+	fmt.Println("Message published to RabbitMQ:", string(body))
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"shortened_url": generatedString})
+	json.NewEncoder(w).Encode(map[string]string{"shortened_url is created": generatedString})
 
 }
 
