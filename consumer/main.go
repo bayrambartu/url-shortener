@@ -5,16 +5,12 @@ import (
 	"log"
 	"os"
 	"time"
+	"url-shotener/internal/models"
+	"url-shotener/internal/rabbitmq"
 	"url-shotener/postgres"
 
 	_ "github.com/lib/pq"
-	amqp "github.com/rabbitmq/amqp091-go"
 )
-
-type LinkMessage struct {
-	ID      int    `json:"id"`
-	Address string `json:"address"`
-}
 
 func main() {
 
@@ -29,37 +25,14 @@ func main() {
 	}
 	defer db.Close()
 
-	conn, err := amqp.Dial(os.Getenv("RABBITMQ_URI"))
+	_, rabbitMQChan, err := rabbitmq.Connect(os.Getenv("RABBITMQ_URI"))
 	if err != nil {
-		log.Println("Failed to connect to RabbitMQ:", err)
-		return
+		log.Fatal(err)
 	}
-	defer conn.Close()
+	defer rabbitMQChan.Close()
 
-	ch, err := conn.Channel()
-
-	if err != nil {
-		log.Println("Failed to open a channel:", err)
-		return
-	}
-	defer ch.Close()
-
-	_, err = ch.QueueDeclare(
-		"shortened_urls",
-		true,
-		false,
-		false,
-		false,
-		nil,
-	)
-
-	if err != nil {
-		log.Println("Failed to declare queue:", err)
-		return
-	}
-
-	msgs, err := ch.Consume(
-		"shortened_urls",
+	msgs, err := rabbitMQChan.Consume(
+		rabbitmq.QueueName,
 		"",
 		false, // manual acknowledgment
 		false,
@@ -76,10 +49,10 @@ func main() {
 	for msg := range msgs {
 		log.Printf("Received message: %s", msg.Body)
 
-		var linkMsg LinkMessage
+		var linkMsg models.LinkMessage
 		if err := json.Unmarshal(msg.Body, &linkMsg); err != nil {
 			log.Println("Failed to parse message:", err)
-			msg.Nack(false, false) // parse edilemeyen mesajı reddet, tekrar kuyruğa koyma
+			msg.Nack(false, false)
 			continue
 		}
 
